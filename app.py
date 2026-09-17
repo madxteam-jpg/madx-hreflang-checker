@@ -1,30 +1,38 @@
 from urllib.parse import urljoin
+import asyncio
 import io
+import sys
 from bs4 import BeautifulSoup
-import cloudscraper  # 👈 Replaces requests
 import matplotlib.pyplot as plt
 import pandas as pd
+from playwright.async_api import async_playwright
 import streamlit as st
+
+# Windows workaround for asyncio loop policy
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
 st.set_page_config(
     page_title="Hreflang Cluster Auditor", layout="wide", page_icon="🌐"
 )
 
-st.title("🌐 Hreflang Cluster Auditor & Registry Tool")
+st.title("🌐 Playwright Hreflang Cluster Auditor")
+st.markdown(
+    "Audit homepage clusters for reciprocity, canonical alignment, self-references, and missing market locales."
+)
 
-# Sidebar Configuration
 st.sidebar.header("Audit Configuration")
-timeout_sec = st.sidebar.slider("Timeout (seconds)", 3, 30, 10)
+timeout_sec = st.sidebar.slider("Timeout (seconds)", 5, 60, 20)
 
 urls_input = st.text_area(
-    "Enter Homepage URLs to Audit (one per line):",
-    height=160,
-    placeholder="https://example.com/en/\nhttps://example.com/ru/\nhttps://example.com/es/",
+    "Enter Homepage URLs (one per line):",
+    height=150,
+    placeholder="https://www.puprime.com/\nhttps://www.puprime.com/ru/",
 )
 
 
 def generate_png_summary(df):
-    """Generates a styled PNG image summary using Matplotlib."""
+    """Generates a styled PNG image summary of the audit results using Matplotlib."""
     fig, ax = plt.subplots(figsize=(10, 5), dpi=300)
     ax.axis("tight")
     ax.axis("off")
@@ -67,56 +75,96 @@ def generate_png_summary(df):
     return buffer
 
 
-def audit_cluster(urls, timeout=10):
-    """Audits hreflang declarations using cloudscraper to bypass 403 WAF blocks."""
-    # Initialize anti-bot scraper engine
-    scraper = cloudscraper.create_scraper(
-        browser={"browser": "chrome", "platform": "windows", "desktop": True}
-    )
+async def fetch_page_with_playwright(url, timeout):
+    """Uses Playwright Chromium instance to bypass Cloudflare bot challenges."""
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-blink-features=AutomationControlled",
+            ],
+        )
+        context = await browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            viewport={"width": 1920, "height": 1080},
+        )
+        page = await context.new_page()
 
-    cluster_data = {}
-    master_targets = {}
-
-    for url in urls:
         try:
-            res = scraper.get(url, timeout=timeout)
-            soup = BeautifulSoup(res.text, "html.parser")
-
-            canonical_tag = soup.find("link", rel="canonical")
-            canonical_url = (
-                canonical_tag.get("href").strip() if canonical_tag else None
+            response = await page.goto(
+                url, wait_until="domcontentloaded", timeout=timeout * 1000
             )
-
-            hreflangs = {}
-            for link in soup.find_all("link", rel="alternate"):
-                lang = link.get("hreflang")
-                href = link.get("href")
-                if lang and href:
-                    clean_lang = lang.lower().strip()
-                    full_href = urljoin(url, href.strip())
-                    hreflangs[clean_lang] = full_href
-
-                    if clean_lang not in master_targets:
-                        master_targets[clean_lang] = full_href
-
-            cluster_data[url] = {
-                "status_code": res.status_code,
-                "final_url": res.url,
-                "is_redirected": res.url.rstrip("/") != url.rstrip("/"),
-                "canonical": canonical_url,
-                "hreflangs": hreflangs,
+            status_code = response.status if response else 200
+            final_url = page.url
+            html_content = await page.content()
+            await browser.close()
+            return {
+                "status_code": status_code,
+                "final_url": final_url,
+                "html": html_content,
                 "error": None,
             }
         except Exception as e:
+            await browser.close()
+            return {
+                "status_code": None,
+                "final_url": None,
+                "html": "",
+                "error": str(e),
+            }
+
+
+def audit_cluster(urls, timeout=20):
+    cluster_data = {}
+    master_targets = {}
+
+    # Step 1: Crawl with Playwright headless browser
+    for url in urls:
+        fetch_res = asyncio.run(fetch_page_with_playwright(url, timeout))
+
+        if fetch_res["error"]:
             cluster_data[url] = {
                 "status_code": None,
                 "final_url": None,
                 "is_redirected": False,
                 "canonical": None,
                 "hreflangs": {},
-                "error": str(e),
+                "error": fetch_res["error"],
             }
+            continue
 
+        soup = BeautifulSoup(fetch_res["html"], "html.parser")
+
+        canonical_tag = soup.find("link", rel="canonical")
+        canonical_url = (
+            canonical_tag.get("href").strip() if canonical_tag else None
+        )
+
+        hreflangs = {}
+        for link in soup.find_all("link", rel="alternate"):
+            lang = link.get("hreflang")
+            href = link.get("href")
+            if lang and href:
+                clean_lang = lang.lower().strip()
+                full_href = urljoin(url, href.strip())
+                hreflangs[clean_lang] = full_href
+
+                if clean_lang not in master_targets:
+                    master_targets[clean_lang] = full_href
+
+        cluster_data[url] = {
+            "status_code": fetch_res["status_code"],
+            "final_url": fetch_res["final_url"],
+            "is_redirected": fetch_res["final_url"].rstrip("/") != url.rstrip("/"),
+            "canonical": canonical_url,
+            "hreflangs": hreflangs,
+            "error": None,
+        }
+
+    # Step 2: Reciprocity & Consistency Checks
     rows = []
     for url in urls:
         d = cluster_data[url]
@@ -130,7 +178,7 @@ def audit_cluster(urls, timeout=10):
                 "Total Locales": 0,
                 "Missing Locales": len(master_targets),
                 "Non-Reciprocal": 0,
-                "Audit Summary": f"Request Error: {d['error']}",
+                "Audit Summary": f"Fetch Error: {d['error']}",
                 "Overall Health": "CRITICAL",
             })
             continue
@@ -203,13 +251,13 @@ def audit_cluster(urls, timeout=10):
     return pd.DataFrame(rows), cluster_data
 
 
-# Execution Flow
-if st.button("🚀 Run Hreflang Audit", type="primary"):
+# Streamlit UI
+if st.button("🚀 Run Playwright Audit", type="primary"):
     urls = [u.strip() for u in urls_input.split("\n") if u.strip()]
     if not urls:
         st.warning("Please enter at least one URL.")
     else:
-        with st.spinner("Bypassing firewall checks and auditing cluster..."):
+        with st.spinner("Launching Chromium to pass Cloudflare verification..."):
             df_results, cluster_data = audit_cluster(urls, timeout_sec)
 
         st.subheader("📊 Executive Audit Summary")
@@ -230,7 +278,7 @@ if st.button("🚀 Run Hreflang Audit", type="primary"):
 
         st.dataframe(df_results, use_container_width=True)
 
-        st.markdown("### 📥 Download Audit Summary Report")
+        st.markdown("### 📥 Download Reports")
         col_csv, col_png = st.columns(2)
 
         csv_data = df_results.to_csv(index=False).encode("utf-8")
