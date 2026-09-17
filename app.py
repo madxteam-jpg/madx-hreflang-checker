@@ -7,6 +7,14 @@ import matplotlib.pyplot as plt
 import pandas as pd
 from playwright.async_api import async_playwright
 import streamlit as st
+import os
+import subprocess
+
+# Ensure Playwright Chromium binary is installed on Streamlit Cloud startup
+try:
+    subprocess.run(["playwright", "install", "chromium"], check=True)
+except Exception as e:
+    print(f"Playwright installation fallback: {e}")
 
 # Windows workaround for asyncio loop policy
 if sys.platform == "win32":
