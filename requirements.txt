@@ -1,5 +1,5 @@
 streamlit
-cloudscraper
+playwright
 beautifulsoup4
 pandas
 matplotlib
