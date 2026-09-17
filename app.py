@@ -1,37 +1,30 @@
 from urllib.parse import urljoin
 import io
+from bs4 import BeautifulSoup
+import cloudscraper  # 👈 Replaces requests
 import matplotlib.pyplot as plt
 import pandas as pd
-import requests
 import streamlit as st
-from bs4 import BeautifulSoup
 
 st.set_page_config(
     page_title="Hreflang Cluster Auditor", layout="wide", page_icon="🌐"
 )
 
-st.title("🌐 Hreflang Cluster Auditor & Summary Generator")
-st.markdown(
-    "Audit homepage clusters for reciprocity, self-references, canonical alignment, and missing market locales."
-)
+st.title("🌐 Hreflang Cluster Auditor & Registry Tool")
 
-# Sidebar settings
-st.sidebar.header("Audit Settings")
-user_agent = st.sidebar.text_input(
-    "User-Agent",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) HreflangAuditor/1.0",
-)
-timeout = st.sidebar.slider("Timeout (seconds)", 3, 30, 10)
+# Sidebar Configuration
+st.sidebar.header("Audit Configuration")
+timeout_sec = st.sidebar.slider("Timeout (seconds)", 3, 30, 10)
 
 urls_input = st.text_area(
-    "Enter Homepage URLs (one per line):",
-    height=150,
+    "Enter Homepage URLs to Audit (one per line):",
+    height=160,
     placeholder="https://example.com/en/\nhttps://example.com/ru/\nhttps://example.com/es/",
 )
 
 
 def generate_png_summary(df):
-    """Generates a styled PNG image summary of the audit results using Matplotlib."""
+    """Generates a styled PNG image summary using Matplotlib."""
     fig, ax = plt.subplots(figsize=(10, 5), dpi=300)
     ax.axis("tight")
     ax.axis("off")
@@ -48,7 +41,7 @@ def generate_png_summary(df):
     ].copy()
 
     summary_df["Source URL"] = summary_df["Source URL"].apply(
-        lambda x: x[:35] + "..." if len(x) > 35 else x
+        lambda x: x[:32] + "..." if len(x) > 32 else x
     )
 
     table_data = [summary_df.columns.values.tolist()] + summary_df.values.tolist()
@@ -57,7 +50,6 @@ def generate_png_summary(df):
         cellText=table_data, colLabels=None, cellLoc="center", loc="center"
     )
 
-    # ✅ FIX: Use auto_set_font_size(False) and set_fontsize(9)
     table.auto_set_font_size(False)
     table.set_fontsize(9)
     table.scale(1.2, 1.8)
@@ -75,49 +67,26 @@ def generate_png_summary(df):
     return buffer
 
 
-from urllib.parse import urljoin
-from bs4 import BeautifulSoup
-import pandas as pd
-import requests
-
-
-def audit_cluster(urls, user_agent=None, timeout=10):
-    """Crawls a list of homepage URLs, extracts declared hreflang tags, and audits
-
-    the cluster for reciprocity, canonical alignment, self-references, and missing
-    locales.
-    """
-    # Real desktop browser headers to prevent WAF / Cloudflare 403 Forbidden blocks
-    headers = {
-        "User-Agent": user_agent
-        or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Connection": "keep-alive",
-        "Upgrade-Insecure-Requests": "1",
-        "Sec-Fetch-Dest": "document",
-        "Sec-Fetch-Mode": "navigate",
-        "Sec-Fetch-Site": "none",
-        "Sec-Fetch-User": "?1",
-    }
+def audit_cluster(urls, timeout=10):
+    """Audits hreflang declarations using cloudscraper to bypass 403 WAF blocks."""
+    # Initialize anti-bot scraper engine
+    scraper = cloudscraper.create_scraper(
+        browser={"browser": "chrome", "platform": "windows", "desktop": True}
+    )
 
     cluster_data = {}
     master_targets = {}
 
-    # Step 1: Crawl each URL and extract declared hreflang tags and metadata
     for url in urls:
         try:
-            res = requests.get(url, headers=headers, timeout=timeout)
+            res = scraper.get(url, timeout=timeout)
             soup = BeautifulSoup(res.text, "html.parser")
 
-            # Extract Canonical URL
             canonical_tag = soup.find("link", rel="canonical")
             canonical_url = (
                 canonical_tag.get("href").strip() if canonical_tag else None
             )
 
-            # Extract Hreflang Tags
             hreflangs = {}
             for link in soup.find_all("link", rel="alternate"):
                 lang = link.get("hreflang")
@@ -127,7 +96,6 @@ def audit_cluster(urls, user_agent=None, timeout=10):
                     full_href = urljoin(url, href.strip())
                     hreflangs[clean_lang] = full_href
 
-                    # Track global set of expected locales across the entire cluster
                     if clean_lang not in master_targets:
                         master_targets[clean_lang] = full_href
 
@@ -149,12 +117,10 @@ def audit_cluster(urls, user_agent=None, timeout=10):
                 "error": str(e),
             }
 
-    # Step 2: Analyze reciprocity, missing variants, and canonical alignment
     rows = []
     for url in urls:
         d = cluster_data[url]
 
-        # Handle failed requests
         if d["error"]:
             rows.append({
                 "Source URL": url,
@@ -169,7 +135,6 @@ def audit_cluster(urls, user_agent=None, timeout=10):
             })
             continue
 
-        # Rule Checks
         declared_urls = set(d["hreflangs"].values())
         has_self_ref = url.rstrip("/") in [
             target.rstrip("/") for target in declared_urls
@@ -183,7 +148,6 @@ def audit_cluster(urls, user_agent=None, timeout=10):
             lang for lang in master_targets if lang not in d["hreflangs"]
         ]
 
-        # Reciprocity Check (Ensure target pages link back to source URL)
         non_reciprocal_count = 0
         for lang, target_url in d["hreflangs"].items():
             if (
@@ -197,7 +161,6 @@ def audit_cluster(urls, user_agent=None, timeout=10):
                 if url.rstrip("/") not in target_declared_urls:
                     non_reciprocal_count += 1
 
-        # Summary flags
         issues = []
         if d["status_code"] != 200:
             issues.append(f"HTTP {d['status_code']}")
@@ -216,7 +179,6 @@ def audit_cluster(urls, user_agent=None, timeout=10):
                 f"{non_reciprocal_count} non-reciprocal return link(s)"
             )
 
-        # Health Grading
         if d["status_code"] != 200 or not canonical_ok or not has_self_ref:
             health = "CRITICAL"
         elif issues:
@@ -241,22 +203,37 @@ def audit_cluster(urls, user_agent=None, timeout=10):
     return pd.DataFrame(rows), cluster_data
 
 
+# Execution Flow
 if st.button("🚀 Run Hreflang Audit", type="primary"):
     urls = [u.strip() for u in urls_input.split("\n") if u.strip()]
     if not urls:
         st.warning("Please enter at least one URL.")
     else:
-        with st.spinner("Auditing hreflang cluster..."):
-            df, cluster_data = audit_cluster(urls)
+        with st.spinner("Bypassing firewall checks and auditing cluster..."):
+            df_results, cluster_data = audit_cluster(urls, timeout_sec)
 
-        st.subheader("📊 Audit Overview")
-        st.dataframe(df, use_container_width=True)
+        st.subheader("📊 Executive Audit Summary")
 
-        st.markdown("### 📥 Download Audit Reports")
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("Total URLs Audited", len(df_results))
+        col2.metric(
+            "Compliant Cluster URLs",
+            len(df_results[df_results["Overall Health"] == "PASS"]),
+        )
+        col3.metric(
+            "Warnings", len(df_results[df_results["Overall Health"] == "WARNING"])
+        )
+        col4.metric(
+            "Critical Errors",
+            len(df_results[df_results["Overall Health"] == "CRITICAL"]),
+        )
+
+        st.dataframe(df_results, use_container_width=True)
+
+        st.markdown("### 📥 Download Audit Summary Report")
         col_csv, col_png = st.columns(2)
 
-        # 1. Download CSV
-        csv_data = df.to_csv(index=False).encode("utf-8")
+        csv_data = df_results.to_csv(index=False).encode("utf-8")
         col_csv.download_button(
             label="📄 Download Report (CSV)",
             data=csv_data,
@@ -264,8 +241,7 @@ if st.button("🚀 Run Hreflang Audit", type="primary"):
             mime="text/csv",
         )
 
-        # 2. Download PNG
-        png_buffer = generate_png_summary(df)
+        png_buffer = generate_png_summary(df_results)
         col_png.download_button(
             label="🖼️ Download Summary Table (PNG)",
             data=png_buffer.getvalue(),
@@ -273,6 +249,15 @@ if st.button("🚀 Run Hreflang Audit", type="primary"):
             mime="image/png",
         )
 
-        # Show inline image preview
-        with st.expander("👁️ Preview PNG Graphic"):
-            st.image(png_buffer, caption="Generated Audit Summary Graphic")
+        st.markdown("---")
+        st.subheader("🔎 Detailed Cluster Diagnostics")
+        for url in urls:
+            data = cluster_data[url]
+            with st.expander(f"Diagnostics: {url}"):
+                if data["error"]:
+                    st.error(f"Error fetching URL: {data['error']}")
+                else:
+                    st.write(f"**Final Response URL:** `{data['final_url']}`")
+                    st.write(f"**Canonical Target:** `{data['canonical']}`")
+                    st.write("**Declared Locales:**")
+                    st.json(data["hreflangs"])
