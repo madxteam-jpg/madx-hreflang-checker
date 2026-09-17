@@ -75,19 +75,49 @@ def generate_png_summary(df):
     return buffer
 
 
-def audit_cluster(urls):
+from urllib.parse import urljoin
+from bs4 import BeautifulSoup
+import pandas as pd
+import requests
+
+
+def audit_cluster(urls, user_agent=None, timeout=10):
+    """Crawls a list of homepage URLs, extracts declared hreflang tags, and audits
+
+    the cluster for reciprocity, canonical alignment, self-references, and missing
+    locales.
+    """
+    # Real desktop browser headers to prevent WAF / Cloudflare 403 Forbidden blocks
+    headers = {
+        "User-Agent": user_agent
+        or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+    }
+
     cluster_data = {}
     master_targets = {}
 
-    # Crawl & parse
+    # Step 1: Crawl each URL and extract declared hreflang tags and metadata
     for url in urls:
         try:
-            res = requests.get(
-                url, headers={"User-Agent": user_agent}, timeout=timeout
-            )
+            res = requests.get(url, headers=headers, timeout=timeout)
             soup = BeautifulSoup(res.text, "html.parser")
-            canonical_tag = soup.find("link", rel="canonical")
 
+            # Extract Canonical URL
+            canonical_tag = soup.find("link", rel="canonical")
+            canonical_url = (
+                canonical_tag.get("href").strip() if canonical_tag else None
+            )
+
+            # Extract Hreflang Tags
             hreflangs = {}
             for link in soup.find_all("link", rel="alternate"):
                 lang = link.get("hreflang")
@@ -96,16 +126,16 @@ def audit_cluster(urls):
                     clean_lang = lang.lower().strip()
                     full_href = urljoin(url, href.strip())
                     hreflangs[clean_lang] = full_href
+
+                    # Track global set of expected locales across the entire cluster
                     if clean_lang not in master_targets:
                         master_targets[clean_lang] = full_href
 
             cluster_data[url] = {
                 "status_code": res.status_code,
                 "final_url": res.url,
-                "is_redirected": res.url != url,
-                "canonical": canonical_tag.get("href")
-                if canonical_tag
-                else None,
+                "is_redirected": res.url.rstrip("/") != url.rstrip("/"),
+                "canonical": canonical_url,
                 "hreflangs": hreflangs,
                 "error": None,
             }
@@ -119,10 +149,12 @@ def audit_cluster(urls):
                 "error": str(e),
             }
 
-    # Evaluate issues
+    # Step 2: Analyze reciprocity, missing variants, and canonical alignment
     rows = []
     for url in urls:
         d = cluster_data[url]
+
+        # Handle failed requests
         if d["error"]:
             rows.append({
                 "Source URL": url,
@@ -132,61 +164,77 @@ def audit_cluster(urls):
                 "Total Locales": 0,
                 "Missing Locales": len(master_targets),
                 "Non-Reciprocal": 0,
-                "Audit Summary": d["error"],
+                "Audit Summary": f"Request Error: {d['error']}",
                 "Overall Health": "CRITICAL",
             })
             continue
 
-        has_self = url in set(d["hreflangs"].values())
-        canonical_ok = (d["canonical"] == url) if d["canonical"] else True
-        missing = [
+        # Rule Checks
+        declared_urls = set(d["hreflangs"].values())
+        has_self_ref = url.rstrip("/") in [
+            target.rstrip("/") for target in declared_urls
+        ]
+
+        canonical_ok = True
+        if d["canonical"]:
+            canonical_ok = d["canonical"].rstrip("/") == url.rstrip("/")
+
+        missing_locales = [
             lang for lang in master_targets if lang not in d["hreflangs"]
         ]
 
-        non_reciprocal = 0
-        for lang, target in d["hreflangs"].items():
-            if target in cluster_data and cluster_data[target]["hreflangs"]:
-                if url not in cluster_data[target]["hreflangs"].values():
-                    non_reciprocal += 1
+        # Reciprocity Check (Ensure target pages link back to source URL)
+        non_reciprocal_count = 0
+        for lang, target_url in d["hreflangs"].items():
+            if (
+                target_url in cluster_data
+                and cluster_data[target_url]["hreflangs"]
+            ):
+                target_declared_urls = [
+                    u.rstrip("/")
+                    for u in cluster_data[target_url]["hreflangs"].values()
+                ]
+                if url.rstrip("/") not in target_declared_urls:
+                    non_reciprocal_count += 1
 
+        # Summary flags
         issues = []
-        if not has_self:
-            issues.append("Missing Self-Reference")
         if d["status_code"] != 200:
             issues.append(f"HTTP {d['status_code']}")
+        if not has_self_ref:
+            issues.append("Missing Self-Reference")
         if d["is_redirected"]:
-            issues.append("Redirected")
+            issues.append(f"Redirects to {d['final_url']}")
         if not canonical_ok:
-            issues.append("Canonical Mismatch")
-        if missing:
-            issues.append(f"Missing {len(missing)} Locales")
-        if non_reciprocal > 0:
-            issues.append(f"{non_reciprocal} Non-Reciprocal")
-
-        health = (
-            "PASS"
-            if not issues
-            else (
-                "CRITICAL"
-                if any(
-                    k in " ".join(issues)
-                    for k in ["HTTP", "Canonical", "Self-Reference"]
-                )
-                else "WARNING"
+            issues.append(f"Canonical mismatch ({d['canonical']})")
+        if missing_locales:
+            issues.append(
+                f"Missing {len(missing_locales)} locale(s): {', '.join(missing_locales)}"
             )
-        )
+        if non_reciprocal_count > 0:
+            issues.append(
+                f"{non_reciprocal_count} non-reciprocal return link(s)"
+            )
+
+        # Health Grading
+        if d["status_code"] != 200 or not canonical_ok or not has_self_ref:
+            health = "CRITICAL"
+        elif issues:
+            health = "WARNING"
+        else:
+            health = "PASS"
 
         rows.append({
             "Source URL": url,
             "Status Code": d["status_code"],
-            "Self Reference": "PASS" if has_self else "FAIL",
+            "Self Reference": "PASS" if has_self_ref else "FAIL",
             "Canonical Match": "PASS" if canonical_ok else "FAIL",
             "Total Locales": len(d["hreflangs"]),
-            "Missing Locales": len(missing),
-            "Non-Reciprocal": non_reciprocal,
+            "Missing Locales": len(missing_locales),
+            "Non-Reciprocal": non_reciprocal_count,
             "Audit Summary": "; ".join(issues)
             if issues
-            else "Fully Reciprocal",
+            else "Fully Reciprocal & Complete",
             "Overall Health": health,
         })
 
