@@ -1,20 +1,20 @@
 from urllib.parse import urljoin
 import asyncio
 import io
+import os
+import subprocess
 import sys
 from bs4 import BeautifulSoup
 import matplotlib.pyplot as plt
 import pandas as pd
 from playwright.async_api import async_playwright
 import streamlit as st
-import os
-import subprocess
 
-# Ensure Playwright Chromium binary is installed on Streamlit Cloud startup
+# Automatically install Playwright Chromium binary on app launch
 try:
     subprocess.run(["playwright", "install", "chromium"], check=True)
 except Exception as e:
-    print(f"Playwright installation fallback: {e}")
+    st.error(f"Error initializing Playwright browser binaries: {e}")
 
 # Windows workaround for asyncio loop policy
 if sys.platform == "win32":
@@ -30,7 +30,7 @@ st.markdown(
 )
 
 st.sidebar.header("Audit Configuration")
-timeout_sec = st.sidebar.slider("Timeout (seconds)", 5, 60, 20)
+timeout_sec = st.sidebar.slider("Timeout (seconds)", 5, 60, 25)
 
 urls_input = st.text_area(
     "Enter Homepage URLs (one per line):",
@@ -84,7 +84,7 @@ def generate_png_summary(df):
 
 
 async def fetch_page_with_playwright(url, timeout):
-    """Uses Playwright Chromium instance to bypass Cloudflare bot challenges."""
+    """Launches Playwright Chromium to bypass Cloudflare bot challenges."""
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=True,
@@ -125,11 +125,10 @@ async def fetch_page_with_playwright(url, timeout):
             }
 
 
-def audit_cluster(urls, timeout=20):
+def audit_cluster(urls, timeout=25):
     cluster_data = {}
     master_targets = {}
 
-    # Step 1: Crawl with Playwright headless browser
     for url in urls:
         fetch_res = asyncio.run(fetch_page_with_playwright(url, timeout))
 
@@ -172,7 +171,6 @@ def audit_cluster(urls, timeout=20):
             "error": None,
         }
 
-    # Step 2: Reciprocity & Consistency Checks
     rows = []
     for url in urls:
         d = cluster_data[url]
@@ -259,7 +257,7 @@ def audit_cluster(urls, timeout=20):
     return pd.DataFrame(rows), cluster_data
 
 
-# Streamlit UI
+# Main App Interface
 if st.button("🚀 Run Playwright Audit", type="primary"):
     urls = [u.strip() for u in urls_input.split("\n") if u.strip()]
     if not urls:
