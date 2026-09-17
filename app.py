@@ -36,7 +36,6 @@ def generate_png_summary(df):
     ax.axis("tight")
     ax.axis("off")
 
-    # Pick key columns for the summary image table
     summary_df = df[
         [
             "Source URL",
@@ -48,7 +47,6 @@ def generate_png_summary(df):
         ]
     ].copy()
 
-    # Truncate long URLs for rendering neatly
     summary_df["Source URL"] = summary_df["Source URL"].apply(
         lambda x: x[:35] + "..." if len(x) > 35 else x
     )
@@ -59,18 +57,17 @@ def generate_png_summary(df):
         cellText=table_data, colLabels=None, cellLoc="center", loc="center"
     )
 
+    # ✅ FIX: Use auto_set_font_size(False) and set_fontsize(9)
     table.auto_set_font_size(False)
-    table.set_font_size(9)
+    table.set_fontsize(9)
     table.scale(1.2, 1.8)
 
-    # Styling colors
     header_color = "#1E3A8A"
     for i in range(len(summary_df.columns)):
         cell = table[0, i]
         cell.set_facecolor(header_color)
         cell.set_text_props(color="white", weight="bold")
 
-    # Save to BytesIO buffer
     buffer = io.BytesIO()
     plt.savefig(buffer, format="png", bbox_inches="tight", pad_inches=0.2)
     buffer.seek(0)
